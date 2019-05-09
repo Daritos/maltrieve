@@ -49,7 +49,7 @@ import feedparser
 import magic
 import requests
 from bs4 import BeautifulSoup
-
+import csv
 
 def hashstr(thestr, hashfn=hashlib.sha1):
     hasher = hashfn()
@@ -63,6 +63,30 @@ def check_proxy(opts):
         my_ip = requests.get('http://ipinfo.io/ip', proxies=opts.proxy).text
         logging.info('External sites see %s', my_ip)
         print('External sites see {ip}'.format(ip=my_ip))
+
+def upload_cape(data, sample, cfg):
+    if data:
+        files = {'file': (sample.file_md5, data)}
+        url = cfg.cape + "/tasks/create/file/"
+        data = dict(
+            priority=cfg.priority,
+            custom=json.dumps(sample.__dict__),
+        )
+        headers = {'User-agent': 'Maltrieve'}
+        try:
+            #response = requests.post(url, data=data, headers=headers, files=files)
+            response = requests.post(url, headers=headers, files=files)
+            try:
+                response_data = response.json()
+            except ValueError:
+                logging.exception("While decoding %s", response.text)
+            else:
+                logging.info("Submitted %s to CAPE, %s", sample.file_md5, response_data)
+        except requests.exceptions.ConnectionError:
+            logging.info("Could not connect to Cuckoo, will attempt local storage")
+            return False
+        else:
+            return True
 
 
 # This gives cuckoo the URL instead of the file.
@@ -166,6 +190,19 @@ def process_malwareurls(response):
 def process_minotaur(response):
     return process_simple_list(response, 'minotaur')
 
+def process_urlhaus(response):
+    source = "urlhaus"
+    urlhaus_sig_bl = ["None","none"]
+    # Extract the csv data
+    csv_file = response.split('\n',9)[-1]
+    # 0:firstseen,1:url,2:filetype,3:md5,4:sha256,5:signature
+    csv_data = csv.reader(csv_file.split('\n'), delimiter=',', quotechar='"')
+    results = list()
+    for row in csv_data:
+        if len(row) >= 6:
+            if row[5] not in urlhaus_sig_bl:
+                results.append(Namespace(description=row[5], source=source, url=row[1], file_md5=row[3]))
+    return results
 
 def process_simple_list(response, source):
     results = list()
@@ -272,7 +309,7 @@ def process_malshare(response, cfg):
             source='malshare',
             url="http://api.malshare.com/sampleshare.php?action=getfile&api_key=%s&hash=%s" % (api_key, file_hash),
             file_md5=file_hash)
-        for file_hash in response.split('\n')
+        for file_hash in response.split('\n')[:cfg.malsharelimit]
     ]
 
 
@@ -299,11 +336,13 @@ def setup_args(args):
     parser.add_argument("-b", "--blacklist", help="Comma separated mimetype blacklist")
     parser.add_argument("-w", "--whitelist", help="Comma separated mimetype whitelist")
     parser.add_argument("-P", "--priority",
-                        help="Cuckoo sample priority", default=2)
+                        help="Cuckoo/CAPE sample priority", default=2)
     parser.add_argument("-c", "--cuckoo", metavar='URL', help="Cuckoo API")
+    parser.add_argument("--cape", metavar='URL', help="CAPE API")
     parser.add_argument('-U', '--useragent', help='HTTP User agent', default="Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 7.1; Trident/5.0)")
     parser.add_argument("--malshare",
                         help="Malshare key", default=None)
+    parser.add_argument("--malsharelimit", help="Set malshare request limit", type=int, default=500)
     parser.add_argument("-t", "--timeout", type=int, default=20,
                         help="HTTP request/response timeout (default 20)")
     parser.add_argument("-N", "--concurrency", type=int, default=5,
@@ -371,6 +410,10 @@ CREATE TABLE IF NOT EXISTS entries (
     def normalise(self, sample):
         if not getattr(sample, 'url_sha1', None):
             sample.url_sha1 = hashstr(sample.url, hashlib.sha1)
+        # Make sure that we only have keys compatible with the current database
+        for key in sample.__dict__.keys():
+            if key not in ['source', 'mime_type', 'url', 'url_sha1', 'file_sha256', 'file_sha1', 'file_md5', 'stamp']:
+                delattr(sample, key)
 
     def insert(self, sample):
         self.normalise(sample)
@@ -458,6 +501,8 @@ class Maltrieve(object):
         stored = False
         if self.opts.cuckoo:
             stored = upload_cuckoo(data, sample, self.opts) or stored
+        if self.opts.cape:
+            stored = upload_cape(data, sample, self.opts) or stored
         # else save to disk
         if not stored:
             if self.opts.sort_mime:
@@ -478,7 +523,8 @@ class Maltrieve(object):
     def _find_remote(self):
         source_urls = {
             'http://urlquery.net/': process_urlquery,
-            "http://dasmalwerk.eu/api/": process_dasmalwerk,
+            # Dasmalwerk has changed its means of hosting to S3 bucket and existing logic is not compatible
+            #"http://dasmalwerk.eu/api/": process_dasmalwerk,
             'http://malc0de.com/rss/': process_malc0de,
             'https://zeustracker.abuse.ch/monitor.php?urlfeed=binaries': process_zeustracker,
             'http://www.malwaredomainlist.com/hostslist/mdl.xml': process_malwaredomainlist,
@@ -486,6 +532,7 @@ class Maltrieve(object):
             'http://malwareurls.joxeankoret.com/normal.txt': process_malwareurls,
             'http://minotauranalysis.com/raw/urls': process_minotaur,
             'http://malwaredb.malekal.com/': process_malwaredb,
+            'https://urlhaus.abuse.ch/downloads/payloads/': process_urlhaus,
 
             # XXX: disabled - requires registration of user agent
             #'http://support.clean-mx.de/clean-mx/rss?scope=viruses&limit=0%2C64': process_xml_list_title,
@@ -494,7 +541,7 @@ class Maltrieve(object):
             source_urls['http://www.malshare.com/daily/malshare.current.txt'] = lambda x: process_malshare(x, self.opts)
 
         logging.info("Retrieving URLs from %d sources", len(source_urls))
-        headers = {'User-Agent': 'github.com/HarryR/maltrieve'}
+        headers = {'User-Agent': 'github.com/Daritos/maltrieve'}
         reqs = [grequests.get(url, timeout=self.opts.timeout, headers=headers, proxies=self.opts.proxy)
                 for url in source_urls]
         source_lists = grequests.map(reqs)
